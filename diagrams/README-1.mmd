@@ -1,0 +1,8 @@
+flowchart LR
+  Y[data/threats.yaml<br/>single source of truth] --> V{scripts/build.py<br/>validate}
+  R[detections/payloop_rules.xml<br/>Wazuh rules] --> V
+  V -- errors --> X[CI fails]
+  V --> O1[STRIDE tables]
+  V --> O2[Risk register + heat map]
+  V --> O3[ATT&CK Navigator layers]
+  V --> O4[Detection traceability + gaps]

@@ -1,0 +1,371 @@
+# PayLoop threat model: single source of truth.
+# Everything in docs/ (tables, risk register, traceability, ATT&CK layer) is generated from this file by scripts/build.py.
+meta:
+  system: PayLoop
+  description: Fictional mobile-money wallet platform (customer API, partner webhooks, admin console, CI/CD). Synthetic, for portfolio use.
+  version: "1.0"
+  methodology: STRIDE per element on a data-flow diagram, mapped to MITRE ATT&CK, scored by likelihood x impact (1-5 each).
+  attack_version: "18"   # adjust to the ATT&CK release you map against
+
+risk_bands: {critical: 20, high: 12, medium: 6}   # score >= value => band; below medium => low
+
+stride: {S: Spoofing, T: Tampering, R: Repudiation, I: Information disclosure, D: Denial of service, E: Elevation of privilege}
+
+elements:
+  - {id: E1, name: Customer client (mobile app / USSD gateway), type: external, boundary: TB1}
+  - {id: E2, name: Partner system (merchant / aggregator), type: external, boundary: TB1}
+  - {id: E3, name: Ops administrator, type: external, boundary: TB1}
+  - {id: P1, name: Reverse proxy and TLS termination, type: process, boundary: TB2}
+  - {id: P2, name: PayLoop API (PHP), type: process, boundary: TB3}
+  - {id: P3, name: Webhook dispatcher (outbound), type: process, boundary: TB4}
+  - {id: P4, name: CI/CD pipeline and image build, type: process, boundary: TB5}
+  - {id: D1, name: Wallet database (users, wallets, transfers), type: store, boundary: TB3}
+  - {id: D2, name: Receipt file store, type: store, boundary: TB3}
+  - {id: D3, name: Security log (JSON lines), type: store, boundary: TB3}
+  - {id: X1, name: SIEM (Wazuh), type: process, boundary: TB3}
+
+attack_techniques:
+  T1005: Data from Local System
+  T1070: Indicator Removal
+  T1078: Valid Accounts
+  T1110: Brute Force
+  T1110.002: Password Cracking
+  T1110.004: Credential Stuffing
+  T1190: Exploit Public-Facing Application
+  T1195.001: Compromise Software Dependencies and Development Tools
+  T1199: Trusted Relationship
+  T1213: Data from Information Repositories
+  T1499: Endpoint Denial of Service
+  T1525: Implant Internal Image
+  T1531: Account Access Removal
+  T1552.001: Credentials In Files
+  T1552.005: Cloud Instance Metadata API
+  T1557: Adversary-in-the-Middle
+  T1562.006: Indicator Blocking
+  T1606: Forge Web Credentials
+  T1611: Escape to Host
+  T1657: Financial Theft
+
+# status: mitigated | partial | open | accepted
+# detections: custom rule ids (must exist in detections/payloop_rules.xml) or "stock:<id>" for built-in Wazuh rules.
+# detection_note is REQUIRED when a threat rated high or above has no detection (preventive-only, pipeline control, etc.).
+threats:
+  - id: TM-01
+    element: P2
+    stride: S
+    title: Online password guessing and spraying against /login
+    scenario: An attacker sends many passwords for one account, or one password across many accounts, from one or many addresses.
+    attack: [T1110]
+    likelihood: 4
+    impact: 4
+    controls: ["Per-username and per-IP failure limits with 429 and Retry-After", "Argon2id password hashes", "Uniform error text, dummy-hash timing equalisation"]
+    detections: [110101, 110111, 110112, 110103, 110113]
+    status: partial
+    residual: "No MFA; low-and-slow or botnet-distributed guessing stays under the thresholds."
+    finding: F7
+  - id: TM-02
+    element: E1
+    stride: S
+    title: Credential stuffing with breached passwords
+    scenario: Valid username and password pairs from other breaches are replayed; each attempt looks like a normal login.
+    attack: [T1110.004]
+    likelihood: 4
+    impact: 4
+    controls: ["Per-IP throttling slows scale", "Breached-password screening and MFA are planned, not built"]
+    detections: [110112]
+    status: open
+    residual: "Throttling does not stop valid credentials. MFA for money movement is the real control."
+  - id: TM-03
+    element: P2
+    stride: S
+    title: Forged session token
+    scenario: An attacker who learns the HMAC signing secret mints a valid admin token.
+    attack: [T1606, T1552.001]
+    likelihood: 3
+    impact: 5
+    controls: ["Secret injected from environment, minimum length, fail-closed", "hash_equals signature check", "Token expiry", "Secret scanning in CI"]
+    detections: [110160, 110161, 110170]
+    status: mitigated
+    residual: "A token forged with the real secret is cryptographically valid and invisible to token rules. Only behaviour (110170) remains, so secret handling is the control."
+    finding: F6
+  - id: TM-04
+    element: P2
+    stride: T
+    title: Transfer amount manipulation (negative, zero, oversized)
+    scenario: A customer submits a negative amount to reverse the direction of a transfer, or an amount larger than their balance.
+    attack: [T1657]
+    likelihood: 3
+    impact: 5
+    controls: ["Integer-only bounded positive amounts", "Balance check inside a write-locked transaction"]
+    detections: [110150, 110153]
+    status: mitigated
+    residual: "On an unpatched build detection fires after funds moved; reconciliation is the backstop."
+    finding: F8
+  - id: TM-05
+    element: P2
+    stride: T
+    title: Duplicate or replayed payment request
+    scenario: A network retry or a malicious replay submits the same transfer twice and it is paid twice.
+    attack: [T1657]
+    likelihood: 4
+    impact: 4
+    controls: ["Mandatory Idempotency-Key with unique index per source wallet", "Replay returns the original result"]
+    detections: [110151, 110152]
+    status: mitigated
+    residual: "Key reuse with a different payload is rejected (409) but not alerted."
+    finding: F8
+  - id: TM-06
+    element: P2
+    stride: T
+    title: Concurrent requests cause double spend
+    scenario: Two simultaneous transfers both pass the balance check before either debit is applied.
+    attack: [T1657]
+    likelihood: 3
+    impact: 5
+    controls: ["BEGIN IMMEDIATE transaction serialises check and update"]
+    detections: []
+    detection_note: "Preventive control. A nightly ledger-versus-balance reconciliation would detect drift; it is documented as a gap, not built."
+    status: mitigated
+    residual: "Single-node SQLite only; a multi-node database needs row-level locking or serialisable isolation."
+    finding: F8
+  - id: TM-07
+    element: D1
+    stride: T
+    title: SQL injection reads or modifies ledger data
+    scenario: Untrusted input reaches a SQL string, letting an attacker read other tables or alter balances.
+    attack: [T1190]
+    likelihood: 4
+    impact: 5
+    controls: ["Parameterised queries everywhere", "Semgrep taint rule in CI", "Least-privilege DB account (documented)"]
+    detections: [110120]
+    status: mitigated
+    residual: "Regex on query strings misses obfuscated payloads and JSON bodies."
+    finding: F1
+  - id: TM-08
+    element: D3
+    stride: R
+    title: Security log tampering or deletion
+    scenario: An attacker with host access edits or removes log lines to hide activity.
+    attack: [T1070]
+    likelihood: 2
+    impact: 4
+    controls: ["Log shipped to the SIEM as written", "Log file owned by a separate user, append only", "File integrity monitoring on the log"]
+    detections: ["stock:550", "stock:553"]
+    status: partial
+    residual: "Between write and shipment there is a short window; tamper-evident chaining is not implemented."
+  - id: TM-09
+    element: P2
+    stride: R
+    title: Cannot attribute a money movement to a person and request
+    scenario: After a disputed transfer the operator cannot show who initiated it, from where, or which request.
+    attack: []
+    likelihood: 3
+    impact: 3
+    controls: ["Every request and money event logs timestamp, authenticated user, source IP and request id", "Request id returned to the client"]
+    detections: [110106, 110107]
+    status: mitigated
+    residual: "Source IP is only as trustworthy as the configured proxy chain."
+  - id: TM-10
+    element: P2
+    stride: I
+    title: Object-level authorisation failure exposes other customers' wallets
+    scenario: A logged-in customer changes an id in the URL and reads another customer's balance and identity.
+    attack: [T1213]
+    likelihood: 4
+    impact: 4
+    controls: ["Central Wallets::assertAccess owner-or-admin guard", "404 for non-owners so existence is not revealed", "Denials are logged"]
+    detections: [110140, 110141]
+    status: mitigated
+    residual: "A single guessed id is indistinguishable from normal traffic; prevention is the control."
+    finding: F2
+  - id: TM-11
+    element: P2
+    stride: E
+    title: Spending from another customer's wallet
+    scenario: A customer sets from_wallet to a wallet they do not own in a transfer request.
+    attack: [T1657]
+    likelihood: 4
+    impact: 5
+    controls: ["Same assertAccess guard on from_wallet before any state change"]
+    detections: [110105, 110141]
+    status: mitigated
+    residual: "Holds only while every new handler calls the guard; the sandbox attack simulation includes a transfer-from-victim scenario to catch a regression."
+  - id: TM-12
+    element: D2
+    stride: I
+    title: Arbitrary file read through the receipt endpoint
+    scenario: Path traversal sequences in the file parameter read files outside the receipts directory.
+    attack: [T1005]
+    likelihood: 3
+    impact: 4
+    controls: ["Allow-list file-name pattern", "realpath containment check"]
+    detections: [110121, 110122]
+    status: mitigated
+    residual: "Double-encoded sequences can evade the request-line rule; the application-level path_blocked event covers them."
+    finding: F3
+  - id: TM-13
+    element: P2
+    stride: I
+    title: Internal details leak through error responses
+    scenario: Unhandled exceptions return stack traces and file paths that help an attacker refine other attacks.
+    attack: [T1190]
+    likelihood: 3
+    impact: 2
+    controls: ["Generic 500 with request id", "Details logged server-side as app_error"]
+    detections: [110123, 110124, 110180]
+    status: mitigated
+    residual: "None significant."
+    finding: F9
+  - id: TM-14
+    element: D1
+    stride: I
+    title: Offline cracking of stolen password hashes
+    scenario: After any database read the attacker cracks the stored hashes on their own hardware.
+    attack: [T1110.002]
+    likelihood: 3
+    impact: 4
+    controls: ["Argon2id with per-password salt"]
+    detections: []
+    detection_note: "Offline activity produces no events on our side. Detection is upstream: database access monitoring and credential-stuffing rules (TM-02)."
+    status: mitigated
+    residual: "Existing hashes need a rehash-on-login migration; until done the legacy tail is weak."
+    finding: F5
+  - id: TM-15
+    element: P3
+    stride: I
+    title: Server-side request forgery through partner webhook tests
+    scenario: A caller supplies an internal or metadata URL and the server fetches it on their behalf.
+    attack: [T1190, T1552.005]
+    likelihood: 3
+    impact: 5
+    controls: ["SsrfGuard: scheme, host allow-list, resolved-IP checks, IP pinning, no redirects, body not reflected", "Egress firewall and IMDSv2 hop limit (documented)"]
+    detections: [110130, 110131, 110132]
+    status: partial
+    residual: "Network-layer egress filtering is a documented requirement, not part of the sandbox."
+    finding: F4
+  - id: TM-16
+    element: P1
+    stride: D
+    title: Request flooding and expensive-endpoint exhaustion
+    scenario: High request volume, or repeated login attempts that each cost a memory-hard hash, exhaust the service.
+    attack: [T1499]
+    likelihood: 3
+    impact: 3
+    controls: ["Proxy rate limiting and request size limits (sandbox nginx config)", "Failed-login limits bound hashing work"]
+    detections: [110123, 110124]
+    status: partial
+    residual: "Volumetric attacks need upstream scrubbing; not in scope."
+  - id: TM-17
+    element: P2
+    stride: D
+    title: Lockout abuse against a victim account
+    scenario: An attacker deliberately fails logins for a victim's username to lock them out.
+    attack: [T1531]
+    likelihood: 3
+    impact: 3
+    controls: ["Counters keyed on username and source IP, time-boxed to 5 minutes"]
+    detections: [110113]
+    status: accepted
+    residual: "Accepted trade-off: a 5 minute nuisance lockout in exchange for brute-force resistance."
+  - id: TM-18
+    element: P2
+    stride: E
+    title: Admin function reached with a stolen or forged token
+    scenario: An attacker presents an admin token to list all users and other privileged data.
+    attack: [T1078]
+    likelihood: 3
+    impact: 5
+    controls: ["Role check on every admin route", "Admin access is always logged", "Token expiry"]
+    detections: [110170]
+    status: partial
+    residual: "No step-up authentication or source allow-listing for admin; detection depends on spotting an unusual source."
+  - id: TM-19
+    element: P4
+    stride: E
+    title: Malicious dependency or compromised CI action
+    scenario: A tampered package or third-party GitHub Action runs in the pipeline with access to secrets and the build output.
+    attack: [T1195.001]
+    likelihood: 3
+    impact: 5
+    controls: ["Actions pinned to commit SHAs", "Lockfiles and dependency scanning", "SBOM per build", "Least-privilege workflow permissions"]
+    detections: []
+    detection_note: "Pipeline control. Enforced by the gate in the secure-pipeline repository; no runtime signal exists in the application."
+    status: partial
+    residual: "Pinning and review have to be maintained; a compromised maintainer of a pinned version is out of scope."
+  - id: TM-20
+    element: P4
+    stride: T
+    title: Secrets committed to the repository or printed in CI logs
+    scenario: A signing key, password or token enters git history or a build log and is harvested.
+    attack: [T1552.001]
+    likelihood: 4
+    impact: 5
+    controls: ["Secret scanning on every push and PR", "Secrets only via environment or secret manager", "Rotation runbook"]
+    detections: []
+    detection_note: "Pipeline control (secret scanning gate). Rotation after any leak is mandatory because history keeps the value."
+    status: mitigated
+    residual: "Scanners miss novel formats; keep patterns tuned."
+    finding: F6
+  - id: TM-21
+    element: P4
+    stride: T
+    title: Vulnerable or backdoored container image, container escape
+    scenario: A bad base image or an over-privileged container gives an attacker code execution and a path to the host.
+    attack: [T1525, T1611]
+    likelihood: 2
+    impact: 5
+    controls: ["Pinned base image, image scan in CI", "Non-root user, read-only root filesystem, dropped capabilities, no-new-privileges"]
+    detections: []
+    detection_note: "Preventive hardening plus image scanning. Runtime container telemetry is out of scope for the sandbox."
+    status: partial
+    residual: "No runtime syscall monitoring."
+  - id: TM-22
+    element: E2
+    stride: S
+    title: Spoofed or unsigned partner callbacks
+    scenario: An attacker posts forged callbacks pretending to be a trusted partner.
+    attack: [T1199]
+    likelihood: 3
+    impact: 4
+    controls: ["Not implemented in the sandbox; design calls for HMAC-signed callbacks with a timestamp and per-partner secrets"]
+    detections: []
+    detection_note: "Open design gap recorded for honesty; no callback receiver exists in the sandbox to instrument."
+    status: open
+    residual: "Open until a signed-callback receiver is built."
+  - id: TM-23
+    element: P1
+    stride: T
+    title: Traffic interception or downgrade between client and proxy
+    scenario: An on-path attacker reads or alters traffic if TLS is missing, weak or strippable.
+    attack: [T1557]
+    likelihood: 2
+    impact: 4
+    controls: ["TLS terminated at the proxy with HSTS and modern protocols (production design)", "Sandbox runs plain HTTP on localhost only"]
+    detections: []
+    detection_note: "Preventive control; the sandbox deliberately omits TLS and this is stated openly."
+    status: partial
+    residual: "Production deployment must add TLS; not demonstrated here."
+  - id: TM-24
+    element: E3
+    stride: S
+    title: Administrator account phished or credentials reused
+    scenario: An attacker obtains an operator's password or session and uses the admin console as that person.
+    attack: [T1078]
+    likelihood: 3
+    impact: 5
+    controls: ["Design requires MFA and source allow-listing for admin; neither is built in the sandbox", "Every admin access is logged with source IP"]
+    detections: [110170, 110112]
+    status: open
+    residual: "Open until MFA and a source allow-list exist; detection relies on noticing an unusual source or time."
+  - id: TM-25
+    element: X1
+    stride: D
+    title: SIEM ingestion fails or is flooded, so attacks go unseen
+    scenario: The agent stops, the log path is misconfigured, or a flood of noise hides real alerts.
+    attack: [T1562.006]
+    likelihood: 3
+    impact: 4
+    controls: ["Agent heartbeat and disconnect alerts", "Rate-limited low-value events", "Replay tests keep the rules honest after every change"]
+    detections: ["stock:504", "stock:506"]
+    status: partial
+    residual: "No end-to-end canary event proving the log path works; a synthetic heartbeat log line would close this."
